@@ -231,3 +231,72 @@
     (ok true)
   )
 )
+
+(define-public (get-asset-status (asset-id uint))
+  (let
+    (
+      (asset (unwrap! (map-get? assets { asset-id: asset-id }) err-not-found))
+    )
+    (ok {
+      status: (get status asset),
+      location: (get location asset),
+      current-custodian: (get current-custodian asset)
+    })
+  )
+)
+
+(define-private (zip-asset-data 
+    (name (string-ascii 64))
+    (description (string-ascii 256))
+    (location (string-ascii 100)))
+    {
+        name: name,
+        description: description,
+        location: location
+    })
+
+
+
+(define-private (create-asset-from-lists (item (tuple (name (string-ascii 64)) 
+                                                     (description (string-ascii 256)) 
+                                                     (location (string-ascii 100))))
+                                       (prior-result (list 10 uint)))
+    (let
+        ((asset-id (var-get next-asset-id))
+         (current-time stacks-block-height))
+        (map-set assets
+            { asset-id: asset-id }
+            {
+                name: (get name item),
+                description: (get description item),
+                owner: tx-sender,
+                current-custodian: tx-sender,
+                status: "created",
+                location: (get location item),
+                created-at: current-time,
+                last-updated: current-time
+            })
+        (var-set next-asset-id (+ asset-id u1))
+        (append prior-result asset-id)
+    )
+)
+
+(define-map asset-search-indices
+    {
+        search-key: (string-ascii 128),
+        search-type: (string-ascii 20)
+    }
+    (list 100 uint)
+)
+
+
+
+
+(define-read-only (search-assets-by-criteria 
+    (search-key (string-ascii 128))
+    (search-type (string-ascii 20)))
+    (ok (default-to (list) 
+        (map-get? asset-search-indices 
+            { search-key: search-key, 
+              search-type: search-type })))
+)
