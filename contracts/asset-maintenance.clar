@@ -4,8 +4,11 @@
 (define-constant err-invalid-interval (err u203))
 (define-constant err-already-completed (err u204))
 (define-constant err-not-due (err u205))
+(define-constant err-insufficient-budget (err u206))
+(define-constant err-invalid-cost (err u207))
 
 (define-data-var next-maintenance-id uint u1)
+(define-data-var next-cost-id uint u1)
 
 (define-map maintenance-schedules
   { maintenance-id: uint }
@@ -45,6 +48,40 @@
   (list 50 uint)
 )
 
+(define-map maintenance-costs
+  { cost-id: uint }
+  {
+    maintenance-id: uint,
+    asset-id: uint,
+    cost-amount: uint,
+    cost-type: (string-ascii 32),
+    description: (string-ascii 256),
+    recorded-by: principal,
+    recorded-at: uint
+  }
+)
+
+(define-map asset-cost-budgets
+  { asset-id: uint }
+  {
+    annual-budget: uint,
+    spent-amount: uint,
+    remaining-budget: uint,
+    budget-period-start: uint,
+    budget-period-end: uint,
+    set-by: principal
+  }
+)
+
+(define-map custodian-cost-summary
+  { custodian: principal }
+  {
+    total-costs: uint,
+    maintenance-count: uint,
+    average-cost: uint
+  }
+)
+
 (define-read-only (get-maintenance-schedule (maintenance-id uint))
   (map-get? maintenance-schedules { maintenance-id: maintenance-id })
 )
@@ -59,6 +96,18 @@
 
 (define-read-only (get-custodian-assignments (custodian principal))
   (default-to (list) (map-get? custodian-maintenance-assignments { custodian: custodian }))
+)
+
+(define-read-only (get-maintenance-cost (cost-id uint))
+  (map-get? maintenance-costs { cost-id: cost-id })
+)
+
+(define-read-only (get-asset-cost-budget (asset-id uint))
+  (map-get? asset-cost-budgets { asset-id: asset-id })
+)
+
+(define-read-only (get-custodian-cost-summary (custodian principal))
+  (map-get? custodian-cost-summary { custodian: custodian })
 )
 
 (define-read-only (is-maintenance-overdue (maintenance-id uint))
@@ -229,6 +278,81 @@
   )
 )
 
+(define-public (set-asset-budget 
+    (asset-id uint)
+    (annual-budget uint)
+    (budget-period-start uint)
+    (budget-period-end uint))
+  (let
+    (
+      (current-time stacks-block-height)
+    )
+    (asserts! (> annual-budget u0) err-invalid-cost)
+    (asserts! (> budget-period-end budget-period-start) err-invalid-interval)
+    
+    (map-set asset-cost-budgets
+      { asset-id: asset-id }
+      {
+        annual-budget: annual-budget,
+        spent-amount: u0,
+        remaining-budget: annual-budget,
+        budget-period-start: budget-period-start,
+        budget-period-end: budget-period-end,
+        set-by: tx-sender
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (record-maintenance-cost 
+    (maintenance-id uint)
+    (cost-amount uint)
+    (cost-type (string-ascii 32))
+    (description (string-ascii 256)))
+  (let
+    (
+      (schedule (unwrap! (map-get? maintenance-schedules { maintenance-id: maintenance-id }) err-not-found))
+      (asset-id (get asset-id schedule))
+      (cost-id (var-get next-cost-id))
+      (current-time stacks-block-height)
+      (budget (map-get? asset-cost-budgets { asset-id: asset-id }))
+    )
+    (asserts! (> cost-amount u0) err-invalid-cost)
+    (asserts! (or 
+                (is-eq tx-sender (get assigned-custodian schedule))
+                (is-eq tx-sender (get created-by schedule))
+              ) 
+              err-unauthorized)
+    
+    (match budget
+      budget-data 
+        (asserts! (>= (get remaining-budget budget-data) cost-amount) err-insufficient-budget)
+      true
+    )
+    
+    (map-set maintenance-costs
+      { cost-id: cost-id }
+      {
+        maintenance-id: maintenance-id,
+        asset-id: asset-id,
+        cost-amount: cost-amount,
+        cost-type: cost-type,
+        description: description,
+        recorded-by: tx-sender,
+        recorded-at: current-time
+      }
+    )
+    
+    (update-asset-budget asset-id cost-amount)
+    (update-custodian-cost-summary tx-sender cost-amount)
+    
+    (var-set next-cost-id (+ cost-id u1))
+    (ok cost-id)
+  )
+)
+
 ;; (define-read-only (get-overdue-maintenance-for-asset (asset-id uint))
 ;;   (let
 ;;     (
@@ -312,5 +436,73 @@
       total-maintenance-schedules: (- total-schedules u1),
       current-block: stacks-block-height
     })
+  )
+)
+
+(define-read-only (get-asset-cost-analysis (asset-id uint))
+  (let
+    (
+      (budget (map-get? asset-cost-budgets { asset-id: asset-id }))
+    )
+    (match budget
+      budget-data 
+        (ok {
+          total-budget: (get annual-budget budget-data),
+          spent-amount: (get spent-amount budget-data),
+          remaining-budget: (get remaining-budget budget-data),
+          budget-utilization: (/ (* (get spent-amount budget-data) u100) (get annual-budget budget-data))
+        })
+      (ok {
+        total-budget: u0,
+        spent-amount: u0,
+        remaining-budget: u0,
+        budget-utilization: u0
+      })
+    )
+  )
+)
+
+(define-private (update-asset-budget (asset-id uint) (cost-amount uint))
+  (let
+    (
+      (current-budget (map-get? asset-cost-budgets { asset-id: asset-id }))
+    )
+    (match current-budget
+      budget-data 
+        (let
+          (
+            (new-spent (+ (get spent-amount budget-data) cost-amount))
+            (new-remaining (- (get remaining-budget budget-data) cost-amount))
+          )
+          (map-set asset-cost-budgets
+            { asset-id: asset-id }
+            (merge budget-data {
+              spent-amount: new-spent,
+              remaining-budget: new-remaining
+            })
+          )
+        )
+      true
+    )
+  )
+)
+
+(define-private (update-custodian-cost-summary (custodian principal) (cost-amount uint))
+  (let
+    (
+      (current-summary (default-to { total-costs: u0, maintenance-count: u0, average-cost: u0 }
+                        (map-get? custodian-cost-summary { custodian: custodian })))
+      (new-total-costs (+ (get total-costs current-summary) cost-amount))
+      (new-maintenance-count (+ (get maintenance-count current-summary) u1))
+      (new-average-cost (/ new-total-costs new-maintenance-count))
+    )
+    (map-set custodian-cost-summary
+      { custodian: custodian }
+      {
+        total-costs: new-total-costs,
+        maintenance-count: new-maintenance-count,
+        average-cost: new-average-cost
+      }
+    )
   )
 )
